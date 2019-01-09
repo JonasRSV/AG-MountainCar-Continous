@@ -93,6 +93,7 @@ class ltesearch():
                 mean = self.lower_bounds + sigmoid(self._agents[aid] @ aob) * (
                     self.upper_bounds - self.lower_bounds)
                 """ Minimize This. """
+                # Err = np.square(act - mean)
                 """ Derivative of Mean Squared Error. """
                 derr_dmean = -2 * (act - mean)
 
