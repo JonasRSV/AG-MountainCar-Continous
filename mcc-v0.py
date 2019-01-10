@@ -1,6 +1,9 @@
 import gym
-import numpy as np
+import sys
+import autograd.numpy as np
+import seaborn
 import random
+import pickle
 import matplotlib.pyplot as plt
 
 
@@ -8,16 +11,60 @@ def sigmoid(x: np.array) -> np.array:
     return np.exp(x) / (np.exp(x) + 1)
 
 
+def relu(x: np.array) -> np.array:
+    return np.maximum(x, 0.8)
+
+
+def M(P: [[np.array], np.array,
+          np.array], obs: np.array, lower_bounds: np.array,
+      upper_bounds: np.array, stochastic: bool) -> np.array:
+    L, M, V = P
+    """ Append constant term. """
+    obs = np.append(obs, 1)
+    for layer in L:
+        obs = sigmoid(layer @ obs)
+    """ 
+    Act as if Every parameter belongs to a special exp distribution.  
+    Autograd cannot handle normal distribution so exp will do.
+    """
+
+    if stochastic:
+        uniform_random = np.clip(np.random.rand(len(upper_bounds)), 0.1, 0.90)
+        #         -||-
+        AC = lower_bounds + sigmoid(
+            #      Inverse Exponential Sampling
+            -np.log(1 - uniform_random) / relu(V @ obs) +
+            # Shift                 -||-
+            (M @ obs)) * (upper_bounds - lower_bounds)
+
+        return AC
+
+    else:
+        return lower_bounds + sigmoid(M @ obs) * (upper_bounds - lower_bounds)
+
+    return obs
+
+
+def msq(*args, a=None):
+    return np.sum(np.square(M(*args) - a))
+
+
 class ltesearch():
-    def __init__(self, obs_space: int, act_space: int, lower_bounds: np.array,
-                 upper_bounds: np.array, population: int, memory: int,
-                 kernel: "f(obs, obs) -> metric", var: np.array):
+    def __init__(self,
+                 obs_space: int,
+                 act_space: int,
+                 lower_bounds: np.array,
+                 upper_bounds: np.array,
+                 population: int,
+                 memory: int,
+                 hidden_layer: int,
+                 kernel: "f(obs, obs) -> metric",
+                 err: "f(*Margs, a=a) -> float" = msq,
+                 f: int = 5,
+                 G: int = 3):
         """ Sanity Checks. """
         if population < 1:
             raise Exception("Cannot have population smaller than 1")
-        """ Environment Information. """
-        self.obs_space = obs_space
-        self.act_space = act_space
         """ Action Bounds. """
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
@@ -27,122 +74,196 @@ class ltesearch():
         self.memory = memory
         """Kernel should be semi-positive definite"""
         self.kernel = kernel
-        """ Variance used in stochastic exploration. """
-        self.var = var
+        """ Err Function """
+        self.err = err
+        self.grad = grad(err)
+        """ F cap. """
+        self.f = f
+        """ G steps. """
+        self.G = G
 
         self._stochastic = True
-        """ Agents """
+        """ Agents +1 for constant """
         self._agents = [
-            np.random.rand(act_space, obs_space) for _ in range(population)
+            {
+                "P": [
+                    # Hidden Layers.
+                    [np.random.rand(hidden_layer, obs_space + 1) - 0.5],
+                    # Mean Value Layer.
+                    np.random.rand(act_space, hidden_layer) - 0.5,
+                    # Variance Layer.
+                    np.abs(np.random.rand(act_space, hidden_layer) + 0.5)
+                ],
+                "S":
+                0,
+                "F":
+                0
+            } for _ in range(population)
         ]
-        self._obs = [None for _ in range(population)]
-        self._awards = [0 for _ in range(population)]
+        self._train_data = [{"sa": [], "rew": 0} for _ in range(population)]
         """ Active Agent. """
-        self._aid = None
-        self._aobs = []
-        self._aagent = None
+        self._active = None
         """ Plot data. """
         self.X = []
         self.Y = []
 
-        self.trains = 0
+        self.best_agent = {"fitness": -10000000, "P": []}
+        self.apex = False
 
-    def get_agent(self, aid: int):
-        self._aid = aid
-        self._aobs = []
-        self._aagent = self._agents[aid]
+    def get_agent(self, active: int) -> "ltesearch":
+        self._active = active
+        self._train_data[active] = {"sa": [], "rew": None}
         return self
 
-    def award(self, score: float):
-        print("Score: {}".format(score))
-        self._awards[self._aid] = score
+    def award(self, rew: float):
+        self._train_data[self._active]["rew"] = rew
 
     def __call__(self, obs: "obs") -> "action":
-        mean = self.lower_bounds + sigmoid(self._aagent @ obs) * (
-            self.upper_bounds - self.lower_bounds)
-
-        if self._stochastic:
-            action = np.random.normal(mean, self.var)
-            self._aobs.append((obs, action))
-            return action
+        if self.apex:
+            return M(self.best_agent["P"], obs, self.lower_bounds,
+                     self.upper_bounds, self._stochastic)
         else:
-            """ Mean === Mode in Normal Dist. """
-            self._aobs.append((obs, mean))
-            return mean
+            act = M(self._agents[self._active]["P"], obs, self.lower_bounds,
+                    self.upper_bounds, self._stochastic)
 
-    def next_agent(self):
-        if self._aid == None:
+            self._train_data[self._active]["sa"].append({
+                "obs": obs,
+                "act": act
+            })
+            return act
+
+    def next_agent(self) -> int:
+        if self._active == None:
             return 0
 
-        self._obs[self._aid] = self._aobs
-
-        if self._aid + 1 < self.population:
-            return self._aid + 1
+        if self._active + 1 < self.population:
+            return self._active + 1
         """ Update all agents and return agent 0. """
-        agent_data = []
-        for aid, obs in enumerate(self._obs):
-            score = 0
-            cumulative_gradient = 0
+        evolution = []
+        for agent_id, data in enumerate(self._train_data):
+            fitness = 0
             """ Exploration Score. """
-            for i, (aob, act) in enumerate(obs):
-                for (ao, _) in obs[max(0, len(obs) - self.memory):]:
-                    score += self.kernel(aob, ao)
-                """ + Environment Reward. """
-                score += self._awards[aid]
-                """ Calculate Gradients. """
-                mean = self.lower_bounds + sigmoid(self._agents[aid] @ aob) * (
-                    self.upper_bounds - self.lower_bounds)
-                """ Minimize This. """
-                # Err = np.square(act - mean)
-                """ Derivative of Mean Squared Error. """
-                derr_dmean = -2 * (act - mean)
+            for frame_index, frame in enumerate(data["sa"]):
+                for past_frame in data["sa"][max(0, frame_index - self.memory):
+                                             frame_index]:
+                    fitness += self.kernel(frame["obs"], past_frame["obs"])
+            """ + Environment Reward & Rescale to make that matter """
+            fitness = data["rew"] + min(
+                np.exp(data["rew"]), 1 / np.exp(
+                    np.round(np.log(abs(fitness) - np.log(abs(data["rew"])))))
+            ) * fitness
 
-                out = self._agents[aid] @ aob
-                """ Derivative of mean (Aka Scaled Sigmoid) """
-                dmean_dout = sigmoid(out) * (1 - sigmoid(out)) * (
-                    self.upper_bounds - self.lower_bounds)
-                """ Derivative of Weights """
-                dout_dw = aob
-                """ Le - Chain Rule Derr/Dw = Derr/Dmean * Dmean/dout * Dout/Dw """
-                gradient = derr_dmean * dmean_dout * dout_dw
+            evolution.append((fitness, agent_id))
+        """ Remember Best Agents... For Demo.. Or What not. """
+        for fitness, agent_id in evolution:
+            if fitness > self.best_agent["fitness"]:
+                self.best_agent["fitness"] = fitness
+                self.best_agent["P"] = [[
+                    np.array(layer, copy=True)
+                    for layer in self._agents[agent_id]["P"][0]
+                ],
+                                        np.array(
+                                            self._agents[agent_id]["P"][1],
+                                            copy=True),
+                                        np.array(
+                                            self._agents[agent_id]["P"][2],
+                                            copy=True)]
+        """ 
+        Now for training Heuristic
+        1. Everyone that has improved enough takes G gradient steps
+        2. Everyone that has not improved enough but improved recently takes a 
+           reversed gradient step
+        3. Everyone that has not improved in a while ... Do something cool
+        """
 
-                cumulative_gradient += gradient
-            """ Maybe clean the gradient here using some nice stuff?. """
-            avg_grad = cumulative_gradient / len(obs)
+        def gradient_step(agent_id: int, S: float):
+            gradients = [[
+                np.zeros_like(layer)
+                for layer in self._agents[agent_id]["P"][0]
+            ],
+                         np.zeros_like(self._agents[agent_id]["P"][1]),
+                         np.zeros_like(self._agents[agent_id]["P"][2])]
 
-            agent_data.append((score, aid, avg_grad))
+            for frame in self._train_data[agent_id]["sa"]:
+                """ Problem, Variance does not take part in this atm..."""
+                local_gradients = self.grad(
+                    self._agents[agent_id]["P"],
+                    frame["obs"],
+                    self.lower_bounds,
+                    self.upper_bounds,
+                    True,
+                    a=frame["act"])
 
-        agent_data.sort(reverse=True)
+                gradients[0] = [
+                    g + g_ for g, g_ in zip(gradients[0], local_gradients[0])
+                ]
+                gradients[1] += local_gradients[1]
+                gradients[2] += local_gradients[2]
 
-        num_apex = max(1, int(self.population * 1))
+            num_grad = len(self._train_data[agent_id]["sa"])
 
-        apex = agent_data[:num_apex]
-        losers = agent_data[num_apex:]
-        """ Remove. """
-        apex.sort(key=lambda x: x[1])
+            for layer, grad in zip(self._agents[agent_id]["P"][0],
+                                   gradients[0]):
+                layer += S * grad / num_grad
 
-        avg_apex_score = 0
-        """ All Apexes take a gradient Step """
-        for score, aid, grad in apex:
-            grad = grad * np.float_power(2, -self.trains / 10)
-            print("Apex: {} -- Score: {} -- Agent: {} -- Grad: {}".format(
-                aid, score, self._agents[aid], grad))
-            self._agents[aid] -= grad
-            avg_apex_score += score
-        print("Average Apex Score: {}".format(avg_apex_score))
-        """ Maybe do something cooler here? """
-        for _, aid, _ in losers:
-            self._agents[aid] += (
-                np.random.rand(self.act_space, self.obs_space) - 0.5)
+            self._agents[agent_id]["P"][1] += S * gradients[1] / num_grad
+            self._agents[agent_id]["P"][2] += S * gradients[2] / num_grad
+
+        for fitness, agent_id in evolution:
+            if fitness > self._agents[agent_id]["S"]:
+                print("Agent: {} -- Improved! S: {} - fitness: {}".format(
+                    agent_id, self._agents[agent_id]["S"], fitness))
+
+                self._agents[agent_id]["S"] = (
+                    self._agents[agent_id]["S"] + fitness) / 2
+
+                for _ in range(self.G):
+                    gradient_step(agent_id, -1)
+
+            elif fitness < self._agents[agent_id]["S"]\
+                    and self._agents[agent_id]["F"] < self.f:
+                print("Agent: {} -- Worse! S: {} - fitness: {}".format(
+                    agent_id, self._agents[agent_id]["S"], fitness))
+
+                self._agents[agent_id]["S"] = (
+                    self._agents[agent_id]["S"] + fitness) / 2
+
+                gradient_step(agent_id, 1)
+
+            else:
+                print("Agent: {} -- In a Slump! :( S: {} - fitness: {}".format(
+                    agent_id, self._agents[agent_id]["S"], fitness))
+                """ Do something Crazy Here!. """
+
+                self._agents[agent_id]["S"] = (
+                    self._agents[agent_id]["S"] + fitness) / 2
+
+                self._agents[agent_id]["P"][0] = [
+                    layer + np.random.normal(layer, 0.1)
+                    for layer in self._agents[agent_id]["P"][0]
+                ]
+                self._agents[agent_id]["P"][1] += np.random.normal(
+                    self._agents[agent_id]["P"][1], 0.1)
+                self._agents[agent_id]["P"][2] += np.random.normal(
+                    self._agents[agent_id]["P"][2], 0.1)
+                """ Remember best for funzies. """
 
         self.X.append(len(self.X))
-        self.Y.append(avg_apex_score)
-        plt.plot(self.X, self.Y)
-        plt.pause(0.001)
+        self.Y.append(self.best_agent["fitness"])
 
-        self.trains += 1
+        seaborn.lineplot(self.X, self.Y)
+        plt.pause(0.01)
 
         return 0
+
+    def save_best(self):
+        with open('best_model.pkl', 'wb') as f:
+            pickle.dump(self.best_agent, f)
+
+    def load_best(self):
+        with open('best_model.pkl', 'rb') as f:
+            self.best_agent = pickle.load(f)
+            print("BEST_AGENT", self.best_agent)
 
 
 def eval_env(env: gym.Env, agent: "f(obs) -> action", render=True) -> float:
@@ -153,7 +274,9 @@ def eval_env(env: gym.Env, agent: "f(obs) -> action", render=True) -> float:
     while not done:
         if render:
             env.render()
-        obs, rew, done, _ = env.step(agent(obs))
+        ac = agent(obs)
+        # print(ac)
+        obs, rew, done, _ = env.step(ac)
         t_rew += rew
 
     return rew
@@ -161,20 +284,33 @@ def eval_env(env: gym.Env, agent: "f(obs) -> action", render=True) -> float:
 
 def main():
     env = gym.make("MountainCarContinuous-v0")
+    # env = gym.make("Pendulum-v0")
 
     search = ltesearch(
         obs_space=len(env.observation_space.high),
         act_space=len(env.action_space.high),
         lower_bounds=env.action_space.low,
         upper_bounds=env.action_space.high,
-        population=1,
+        population=5,
         memory=40,
-        kernel=lambda x, y: np.sum(np.abs(x - y)),
-        var=0.05 * env.action_space.high - env.action_space.low)
+        hidden_layer=50,
+        kernel=lambda x, y: np.mean(np.square(x - y)))
 
-    for _ in range(1000):
-        agent = search.get_agent(search.next_agent())
-        agent.award(eval_env(env, agent, render=False))
+    if len(sys.argv) == 1:
+
+        for _ in range(400):
+            agent = search.get_agent(search.next_agent())
+            agent.award(eval_env(env, agent, render=False))
+
+        search.save_best()
+        plt.show()
+    elif sys.argv[1] == "-r":
+
+        search.load_best()
+        search._stochastic = False
+        search.apex = True
+
+        print(eval_env(env, search, render=True))
 
     env.close()
 
